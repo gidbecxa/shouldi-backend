@@ -2,6 +2,7 @@ import { Body, Controller, Get, Param, Patch, Post, UseGuards } from "@nestjs/co
 
 import { AdminSecretGuard } from "../common/guards/admin-secret.guard";
 import { AdminService } from "./admin.service";
+import { SetQotdDto } from "./dto/set-qotd.dto";
 import { UpdateQuestionStatusDto } from "./dto/update-question-status.dto";
 
 @Controller("admin")
@@ -22,5 +23,10 @@ export class AdminController {
   @Post("users/:id/ban")
   async banUser(@Param("id") id: string) {
     return this.adminService.banUser(id);
+  }
+
+  @Patch("qotd")
+  async setQotd(@Body() body: SetQotdDto) {
+    return this.adminService.setQotd(body.question_id);
   }
 }

@@ -12,12 +12,16 @@ import { randomUUID } from "crypto";
 import { createCanvas } from "@napi-rs/canvas";
 
 import { DatabaseService } from "../common/database/database.service";
+import { withTransientDatabaseRetry } from "../common/database/transient-database.util";
 import { CurrentUserService } from "../common/current-user.service";
 import { RequestWithDevice } from "../common/types/request-with-device.interface";
-import { questions, reports, votes } from "../db/schema";
+import { questions, reports, scheduledNotifications, shares, votes } from "../db/schema";
+import { RedisService } from "../lib/redis.service";
+import { NotificationTriggersService } from "../jobs/notification-triggers.service";
 import { ContentFilterService } from "./content-filter.service";
 import { CreateQuestionDto } from "./dto/create-question.dto";
 import { ReportDto } from "./dto/report.dto";
+import { ShareDto } from "./dto/share.dto";
 import { VoteDto } from "./dto/vote.dto";
 
 const AUTO_FLAG_THRESHOLD = 3;
@@ -28,6 +32,8 @@ export class QuestionsService {
     private readonly contentFilterService: ContentFilterService,
     private readonly currentUserService: CurrentUserService,
     private readonly databaseService: DatabaseService,
+    private readonly redisService: RedisService,
+    private readonly notificationTriggersService: NotificationTriggersService,
   ) {}
 
   private get db() {
@@ -41,81 +47,101 @@ export class QuestionsService {
     cursor?: string,
     limit = 20,
   ) {
-    const currentUser = await this.currentUserService.getById(request.userId);
-    const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(limit, 50)) : 20;
+    return withTransientDatabaseRetry(async () => {
+      const currentUser = await this.currentUserService.getById(request.userId);
+      const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(limit, 50)) : 20;
 
-    const baseWhere = [eq(questions.status, "active")];
-    if (category) {
-      baseWhere.push(eq(questions.category, category));
-    }
+      const baseWhere = [eq(questions.status, "active")];
+      if (category) {
+        baseWhere.push(eq(questions.category, category));
+      }
 
-    let questionRows: (typeof questions.$inferSelect)[];
-    let nextCursor: string | null = null;
+      let questionRows: (typeof questions.$inferSelect)[];
+      let nextCursor: string | null = null;
 
-    if (sort === "hot") {
-      const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-      const rows = await this.db
-        .select()
-        .from(questions)
-        .where(and(...baseWhere, gt(questions.createdAt, since)))
-        .orderBy(desc(questions.createdAt))
-        .limit(100);
+      if (sort === "hot") {
+        const since = new Date(Date.now() - 48 * 60 * 60 * 1000);
+        const rows = await this.db
+          .select()
+          .from(questions)
+          .where(and(...baseWhere, gt(questions.createdAt, since)))
+          .orderBy(desc(questions.createdAt))
+          .limit(100);
 
-      const now = Date.now();
-      questionRows = rows
-        .map((row) => {
-          const totalVotes = row.yesCount + row.noCount;
-          const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 1);
-          return { row, score: totalVotes / Math.pow(ageHours, 1.5) };
-        })
-        .sort((a, b) => b.score - a.score)
-        .slice(0, safeLimit)
-        .map((entry) => entry.row);
-    } else {
-      const whereClause = cursor
-        ? and(...baseWhere, lt(questions.createdAt, new Date(cursor)))
-        : and(...baseWhere);
+        const now = Date.now();
+        questionRows = rows
+          .map((row) => {
+            const totalVotes = row.yesCount + row.noCount;
+            const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 1);
+            return { row, score: totalVotes / Math.pow(ageHours, 1.5) };
+          })
+          .sort((a, b) => b.score - a.score)
+          .slice(0, safeLimit)
+          .map((entry) => entry.row);
+      } else {
+        const whereClause = cursor
+          ? and(...baseWhere, lt(questions.createdAt, new Date(cursor)))
+          : and(...baseWhere);
 
-      const rows = await this.db
-        .select()
-        .from(questions)
-        .where(whereClause)
-        .orderBy(desc(questions.createdAt))
-        .limit(safeLimit + 1);
+        const rows = await this.db
+          .select()
+          .from(questions)
+          .where(whereClause)
+          .orderBy(desc(questions.createdAt))
+          .limit(safeLimit + 1);
 
-      const hasMore = rows.length > safeLimit;
-      questionRows = hasMore ? rows.slice(0, safeLimit) : rows;
-      nextCursor = hasMore ? (questionRows[questionRows.length - 1]?.createdAt?.toISOString() ?? null) : null;
-    }
+        const hasMore = rows.length > safeLimit;
+        questionRows = hasMore ? rows.slice(0, safeLimit) : rows;
+        nextCursor = hasMore
+          ? (questionRows[questionRows.length - 1]?.createdAt?.toISOString() ?? null)
+          : null;
+      }
 
-    const userVoteMap = await this.loadUserVotes(
-      currentUser.id,
-      questionRows.map((r) => r.id),
-    );
+      const userVoteMap = await this.loadUserVotes(
+        currentUser.id,
+        questionRows.map((r) => r.id),
+      );
 
-    return {
-      questions: questionRows.map((row) =>
-        this.toQuestionResponse(row, currentUser.id, userVoteMap.get(row.id) ?? null),
-      ),
-      next_cursor: nextCursor,
-    };
+      // Fetch trending IDs from Redis (top 5)
+      let trendingIds: Set<string> = new Set();
+      try {
+        const redis = this.redisService.getClient();
+        const ids = await redis.zrange("trending:questions", 0, 4, { rev: true });
+        trendingIds = new Set(ids.filter((id): id is string => typeof id === "string"));
+      } catch {
+        // Non-fatal — trending badge is cosmetic
+      }
+
+      return {
+        questions: questionRows.map((row) =>
+          this.toQuestionResponse(row, currentUser.id, userVoteMap.get(row.id) ?? null, trendingIds.has(row.id)),
+        ),
+        next_cursor: nextCursor,
+      };
+    }, {
+      label: "QuestionsService.getFeed",
+    });
   }
 
   async getQuestionById(questionId: string, request: RequestWithDevice) {
-    const currentUser = await this.currentUserService.getById(request.userId);
+    return withTransientDatabaseRetry(async () => {
+      const currentUser = await this.currentUserService.getById(request.userId);
 
-    const rows = await this.db
-      .select()
-      .from(questions)
-      .where(and(eq(questions.id, questionId), ne(questions.status, "deleted")))
-      .limit(1);
+      const rows = await this.db
+        .select()
+        .from(questions)
+        .where(and(eq(questions.id, questionId), ne(questions.status, "deleted")))
+        .limit(1);
 
-    if (rows.length === 0) {
-      throw new NotFoundException({ error: "not_found" });
-    }
+      if (rows.length === 0) {
+        throw new NotFoundException({ error: "not_found" });
+      }
 
-    const voteMap = await this.loadUserVotes(currentUser.id, [questionId]);
-    return this.toQuestionResponse(rows[0], currentUser.id, voteMap.get(questionId) ?? null);
+      const voteMap = await this.loadUserVotes(currentUser.id, [questionId]);
+      return this.toQuestionResponse(rows[0], currentUser.id, voteMap.get(questionId) ?? null, false);
+    }, {
+      label: "QuestionsService.getQuestionById",
+    });
   }
 
   async createQuestion(createQuestionDto: CreateQuestionDto, request: RequestWithDevice) {
@@ -172,7 +198,20 @@ export class QuestionsService {
       throw new InternalServerErrorException("Failed to create question");
     }
 
-    return { question: this.toQuestionResponse(inserted, currentUser.id, null) };
+    // Schedule expiry warning (1 hour before expiry)
+    const expiryWarningAt = new Date(expiresAt.getTime() - 60 * 60 * 1000);
+    if (expiryWarningAt > new Date()) {
+      void this.db.insert(scheduledNotifications).values({
+        userId: currentUser.id,
+        questionId: inserted.id,
+        type: "expiry_warning",
+        sendAt: expiryWarningAt,
+      }).catch((err: unknown) => {
+        console.error("[questions] Failed to schedule expiry warning", err instanceof Error ? err.message : err);
+      });
+    }
+
+    return { question: this.toQuestionResponse(inserted, currentUser.id, null, false) };
   }
 
   async vote(questionId: string, voteDto: VoteDto, request: RequestWithDevice) {
@@ -231,12 +270,55 @@ export class QuestionsService {
     const noCount = updated.noCount;
     const totalVotes = yesCount + noCount;
 
+    // Fire notification triggers non-blockingly (never delay the vote response)
+    const fullQuestionRows = await this.db
+      .select()
+      .from(questions)
+      .where(eq(questions.id, questionId))
+      .limit(1);
+
+    if (fullQuestionRows[0]) {
+      setImmediate(() => {
+        this.notificationTriggersService
+          .triggerVoteNotifications(fullQuestionRows[0])
+          .catch((err: unknown) => {
+            console.error("[questions] triggerVoteNotifications failed", err instanceof Error ? err.message : err);
+          });
+      });
+    }
+
     return {
       yes_count: yesCount,
       no_count: noCount,
       yes_percent: totalVotes > 0 ? Math.round((yesCount / totalVotes) * 100) : 0,
       user_vote: voteDto.vote,
     };
+  }
+
+  async logShare(questionId: string, shareDto: ShareDto, request: RequestWithDevice) {
+    const currentUser = await this.currentUserService.getById(request.userId);
+
+    try {
+      await this.db.insert(shares).values({
+        questionId,
+        userId: currentUser.id,
+        shareType: shareDto.share_type,
+      });
+
+      // Increment share_count on the question (non-fatal if it fails)
+      await this.db
+        .update(questions)
+        .set({ shareCount: sql`share_count + 1` })
+        .where(eq(questions.id, questionId));
+    } catch (err: unknown) {
+      const pgError = err as { code?: string };
+      if (pgError.code !== "23505") {
+        // Ignore duplicate share logs — sharing the same way is fine
+        console.error("[questions] logShare failed", err instanceof Error ? err.message : err);
+      }
+    }
+
+    return { logged: true };
   }
 
   async report(questionId: string, reportDto: ReportDto, request: RequestWithDevice) {
@@ -275,87 +357,91 @@ export class QuestionsService {
   }
 
   async shareCardPng(questionId: string) {
-    const rows = await this.db
-      .select({
-        text: questions.text,
-        category: questions.category,
-        yesCount: questions.yesCount,
-        noCount: questions.noCount,
-      })
-      .from(questions)
-      .where(eq(questions.id, questionId))
-      .limit(1);
+    return withTransientDatabaseRetry(async () => {
+      const rows = await this.db
+        .select({
+          text: questions.text,
+          category: questions.category,
+          yesCount: questions.yesCount,
+          noCount: questions.noCount,
+        })
+        .from(questions)
+        .where(eq(questions.id, questionId))
+        .limit(1);
 
-    if (rows.length === 0) {
-      throw new NotFoundException({ error: "not_found" });
-    }
+      if (rows.length === 0) {
+        throw new NotFoundException({ error: "not_found" });
+      }
 
-    const row = rows[0];
-    const totalVotes = row.yesCount + row.noCount;
-    const yesPercent = totalVotes > 0 ? Math.round((row.yesCount / totalVotes) * 100) : 0;
-    const noPercent = 100 - yesPercent;
+      const row = rows[0];
+      const totalVotes = row.yesCount + row.noCount;
+      const yesPercent = totalVotes > 0 ? Math.round((row.yesCount / totalVotes) * 100) : 0;
+      const noPercent = 100 - yesPercent;
 
-    const width = 1200;
-    const height = 630;
-    const canvas = createCanvas(width, height);
-    const ctx = canvas.getContext("2d");
+      const width = 1200;
+      const height = 630;
+      const canvas = createCanvas(width, height);
+      const ctx = canvas.getContext("2d");
 
-    const backgroundGradient = ctx.createLinearGradient(0, 0, width, height);
-    backgroundGradient.addColorStop(0, "#FFFBEF");
-    backgroundGradient.addColorStop(0.55, "#FFF2C5");
-    backgroundGradient.addColorStop(1, "#FFE7A5");
-    ctx.fillStyle = backgroundGradient;
-    ctx.fillRect(0, 0, width, height);
+      const backgroundGradient = ctx.createLinearGradient(0, 0, width, height);
+      backgroundGradient.addColorStop(0, "#FFFBEF");
+      backgroundGradient.addColorStop(0.55, "#FFF2C5");
+      backgroundGradient.addColorStop(1, "#FFE7A5");
+      ctx.fillStyle = backgroundGradient;
+      ctx.fillRect(0, 0, width, height);
 
-    ctx.fillStyle = "rgba(255, 247, 220, 0.72)";
-    ctx.fillRect(50, 48, width - 100, height - 96);
+      ctx.fillStyle = "rgba(255, 247, 220, 0.72)";
+      ctx.fillRect(50, 48, width - 100, height - 96);
 
-    ctx.fillStyle = "rgba(244, 196, 48, 0.34)";
-    ctx.fillRect(50, 48, width - 100, 8);
+      ctx.fillStyle = "rgba(244, 196, 48, 0.34)";
+      ctx.fillRect(50, 48, width - 100, 8);
 
-    ctx.fillStyle = "#7A5A03";
-    ctx.font = "700 35px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
-    ctx.fillText("SHOULD I?", 90, 120);
+      ctx.fillStyle = "#7A5A03";
+      ctx.font = "700 35px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
+      ctx.fillText("SHOULD I?", 90, 120);
 
-    ctx.fillStyle = "#2B2102";
-    ctx.font = "700 56px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
-    const wrappedQuestion = this.wrapText(ctx, row.text, width - 180);
-    let y = 196;
-    for (const line of wrappedQuestion.slice(0, 3)) {
-      ctx.fillText(line, 90, y);
-      y += 68;
-    }
+      ctx.fillStyle = "#2B2102";
+      ctx.font = "700 56px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
+      const wrappedQuestion = this.wrapText(ctx, row.text, width - 180);
+      let y = 196;
+      for (const line of wrappedQuestion.slice(0, 3)) {
+        ctx.fillText(line, 90, y);
+        y += 68;
+      }
 
-    ctx.fillStyle = "#7A6320";
-    ctx.font = "600 24px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
-    ctx.fillText(`Category: ${row.category}`, 90, y + 8);
+      ctx.fillStyle = "#7A6320";
+      ctx.font = "600 24px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
+      ctx.fillText(`Category: ${row.category}`, 90, y + 8);
 
-    const barX = 90;
-    const barY = 438;
-    const barWidth = width - 180;
-    const barHeight = 32;
+      const barX = 90;
+      const barY = 438;
+      const barWidth = width - 180;
+      const barHeight = 32;
 
-    ctx.fillStyle = "#F2DE9E";
-    ctx.fillRect(barX, barY, barWidth, barHeight);
+      ctx.fillStyle = "#F2DE9E";
+      ctx.fillRect(barX, barY, barWidth, barHeight);
 
-    const yesWidth = Math.round((yesPercent / 100) * barWidth);
-    ctx.fillStyle = "#22C55E";
-    ctx.fillRect(barX, barY, yesWidth, barHeight);
+      const yesWidth = Math.round((yesPercent / 100) * barWidth);
+      ctx.fillStyle = "#22C55E";
+      ctx.fillRect(barX, barY, yesWidth, barHeight);
 
-    ctx.fillStyle = "#EF4444";
-    ctx.fillRect(barX + yesWidth, barY, Math.max(0, barWidth - yesWidth), barHeight);
+      ctx.fillStyle = "#EF4444";
+      ctx.fillRect(barX + yesWidth, barY, Math.max(0, barWidth - yesWidth), barHeight);
 
-    ctx.fillStyle = "#2B2102";
-    ctx.font = "700 30px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
-    ctx.fillText(`YES ${yesPercent}%`, barX, 510);
-    ctx.fillText(`NO ${noPercent}%`, barX + 260, 510);
+      ctx.fillStyle = "#2B2102";
+      ctx.font = "700 30px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
+      ctx.fillText(`YES ${yesPercent}%`, barX, 510);
+      ctx.fillText(`NO ${noPercent}%`, barX + 260, 510);
 
-    ctx.fillStyle = "#7A6320";
-    ctx.font = "600 22px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
-    ctx.fillText(`${totalVotes} total votes`, barX, 554);
-    ctx.fillText("shouldi.app", width - 210, 554);
+      ctx.fillStyle = "#7A6320";
+      ctx.font = "600 22px 'Trebuchet MS', 'Helvetica Neue', Arial, sans-serif";
+      ctx.fillText(`${totalVotes} total votes`, barX, 554);
+      ctx.fillText("shouldi.app", width - 210, 554);
 
-    return canvas.toBuffer("image/png");
+      return canvas.toBuffer("image/png");
+    }, {
+      label: "QuestionsService.shareCardPng",
+    });
   }
 
   private wrapText(ctx: { measureText: (value: string) => { width: number } }, text: string, maxWidth: number) {
@@ -402,6 +488,7 @@ export class QuestionsService {
     question: typeof questions.$inferSelect,
     currentUserId: string,
     userVote: "yes" | "no" | null,
+    isTrending = false,
   ) {
     const totalVotes = question.yesCount + question.noCount;
     const yesPercent = totalVotes > 0 ? Math.round((question.yesCount / totalVotes) * 100) : 0;
@@ -418,6 +505,7 @@ export class QuestionsService {
       created_at: question.createdAt.toISOString(),
       user_voted: userVote,
       is_own: question.userId === currentUserId,
+      is_trending: isTrending,
     };
   }
 }

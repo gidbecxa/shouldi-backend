@@ -10,6 +10,7 @@ import { OAuth2Client } from "google-auth-library";
 import { AuthTokenService } from "../common/auth-token.service";
 import { CurrentUserService } from "../common/current-user.service";
 import { DatabaseService } from "../common/database/database.service";
+import { withTransientDatabaseRetry } from "../common/database/transient-database.util";
 import { users } from "../db/schema";
 
 const userSessionProjection = {
@@ -137,13 +138,17 @@ export class AuthService {
   }
 
   private async findSessionRowByUserId(userId: string) {
-    const rows = await this.db
-      .select(userSessionProjection)
-      .from(users)
-      .where(eq(users.id, userId))
-      .limit(1);
+    return withTransientDatabaseRetry(async () => {
+      const rows = await this.db
+        .select(userSessionProjection)
+        .from(users)
+        .where(eq(users.id, userId))
+        .limit(1);
 
-    return (rows[0] as UserSessionRow | undefined) ?? null;
+      return (rows[0] as UserSessionRow | undefined) ?? null;
+    }, {
+      label: "AuthService.findSessionRowByUserId",
+    });
   }
 
   private async findSessionRowByGoogleIdentity(
@@ -151,41 +156,45 @@ export class AuthService {
     email: string | null,
     deviceId: string | null,
   ) {
-    const byGoogleSub = await this.db
-      .select(userSessionProjection)
-      .from(users)
-      .where(eq(users.googleSub, googleSub))
-      .limit(1);
-
-    if (byGoogleSub.length > 0) {
-      return byGoogleSub[0] as UserSessionRow;
-    }
-
-    if (email) {
-      const byEmail = await this.db
+    return withTransientDatabaseRetry(async () => {
+      const byGoogleSub = await this.db
         .select(userSessionProjection)
         .from(users)
-        .where(eq(users.email, email))
+        .where(eq(users.googleSub, googleSub))
         .limit(1);
 
-      if (byEmail.length > 0) {
-        return byEmail[0] as UserSessionRow;
+      if (byGoogleSub.length > 0) {
+        return byGoogleSub[0] as UserSessionRow;
       }
-    }
 
-    if (deviceId) {
-      const byDevice = await this.db
-        .select(userSessionProjection)
-        .from(users)
-        .where(eq(users.deviceId, deviceId))
-        .limit(1);
+      if (email) {
+        const byEmail = await this.db
+          .select(userSessionProjection)
+          .from(users)
+          .where(eq(users.email, email))
+          .limit(1);
 
-      if (byDevice.length > 0) {
-        return byDevice[0] as UserSessionRow;
+        if (byEmail.length > 0) {
+          return byEmail[0] as UserSessionRow;
+        }
       }
-    }
 
-    return null;
+      if (deviceId) {
+        const byDevice = await this.db
+          .select(userSessionProjection)
+          .from(users)
+          .where(eq(users.deviceId, deviceId))
+          .limit(1);
+
+        if (byDevice.length > 0) {
+          return byDevice[0] as UserSessionRow;
+        }
+      }
+
+      return null;
+    }, {
+      label: "AuthService.findSessionRowByGoogleIdentity",
+    });
   }
 
   private async updateIdentity(userId: string, identity: GoogleIdentity) {

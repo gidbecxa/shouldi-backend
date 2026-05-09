@@ -6,10 +6,12 @@ import {
 import { and, desc, eq, ne } from "drizzle-orm";
 
 import { DatabaseService } from "../common/database/database.service";
+import { withTransientDatabaseRetry } from "../common/database/transient-database.util";
 import { CurrentUserService } from "../common/current-user.service";
 import { RequestWithDevice } from "../common/types/request-with-device.interface";
 import { questions, users } from "../db/schema";
 import { UpdatePushTokenDto } from "./dto/update-push-token.dto";
+import { UpdateTimezoneDto } from "./dto/update-timezone.dto";
 
 @Injectable()
 export class UsersService {
@@ -35,43 +37,58 @@ export class UsersService {
   }
 
   async getMyQuestions(request: RequestWithDevice) {
+    return withTransientDatabaseRetry(async () => {
+      const currentUser = await this.currentUserService.getById(request.userId);
+
+      const rows = await this.databaseService.db
+        .select({
+          id: questions.id,
+          text: questions.text,
+          category: questions.category,
+          yesCount: questions.yesCount,
+          noCount: questions.noCount,
+          expiresAt: questions.expiresAt,
+          createdAt: questions.createdAt,
+        })
+        .from(questions)
+        .where(and(eq(questions.userId, currentUser.id), ne(questions.status, "deleted")))
+        .orderBy(desc(questions.createdAt))
+        .limit(100);
+
+      return {
+        questions: rows.map((row) => {
+          const totalVotes = row.yesCount + row.noCount;
+          const yesPercent = totalVotes > 0 ? Math.round((row.yesCount / totalVotes) * 100) : 0;
+
+          return {
+            id: row.id,
+            text: row.text,
+            category: row.category,
+            yes_count: row.yesCount,
+            no_count: row.noCount,
+            yes_percent: yesPercent,
+            total_votes: totalVotes,
+            expires_at: row.expiresAt.toISOString(),
+            created_at: row.createdAt.toISOString(),
+            user_voted: null,
+            is_own: true,
+          };
+        }),
+      };
+    }, {
+      label: "UsersService.getMyQuestions",
+    });
+  }
+
+  async updateTimezone(request: RequestWithDevice, body: UpdateTimezoneDto) {
     const currentUser = await this.currentUserService.getById(request.userId);
 
-    const rows = await this.databaseService.db
-      .select({
-        id: questions.id,
-        text: questions.text,
-        category: questions.category,
-        yesCount: questions.yesCount,
-        noCount: questions.noCount,
-        expiresAt: questions.expiresAt,
-        createdAt: questions.createdAt,
-      })
-      .from(questions)
-      .where(and(eq(questions.userId, currentUser.id), ne(questions.status, "deleted")))
-      .orderBy(desc(questions.createdAt))
-      .limit(100);
+    await this.databaseService.db
+      .update(users)
+      .set({ timezoneOffset: body.timezone_offset })
+      .where(eq(users.id, currentUser.id));
 
-    return {
-      questions: rows.map((row) => {
-        const totalVotes = row.yesCount + row.noCount;
-        const yesPercent = totalVotes > 0 ? Math.round((row.yesCount / totalVotes) * 100) : 0;
-
-        return {
-          id: row.id,
-          text: row.text,
-          category: row.category,
-          yes_count: row.yesCount,
-          no_count: row.noCount,
-          yes_percent: yesPercent,
-          total_votes: totalVotes,
-          expires_at: row.expiresAt.toISOString(),
-          created_at: row.createdAt.toISOString(),
-          user_voted: null,
-          is_own: true,
-        };
-      }),
-    };
+    return { ok: true };
   }
 
   async deleteMyQuestion(request: RequestWithDevice, questionId: string) {

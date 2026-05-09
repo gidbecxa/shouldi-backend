@@ -1,0 +1,37 @@
+# fly.toml — Should I? API
+# Region: London (lhr) — closest Fly region to Supabase eu-west-1
+
+app = "shouldi-api"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8080"
+  TZ = "UTC"
+
+# HTTP service: Fly Proxy terminates TLS and forwards to port 8080 inside
+# the container. force_https ensures all plain-HTTP traffic is redirected.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep one machine always running so cron jobs never miss a tick.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  # Health check on the NestJS health endpoint (registered as /v1/health).
+  [[http_service.checks]]
+    grace_period  = "20s"
+    interval      = "30s"
+    method        = "GET"
+    path          = "/v1/health"
+    timeout       = "10s"
+
+# Smallest always-on machine: 256 MB RAM is enough for idle NestJS + cron.
+# Upgrade to shared-cpu-2x / 512mb if p99 latency climbs under load.
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "256mb"

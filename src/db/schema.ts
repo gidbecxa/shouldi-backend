@@ -1,5 +1,6 @@
 import {
   boolean,
+  date,
   index,
   integer,
   pgEnum,
@@ -27,6 +28,9 @@ export const users = pgTable("users", {
   isBanned: boolean("is_banned").default(false).notNull(),
   banReason: text("ban_reason"),
   pushToken: text("push_token"),
+  lastActiveAt: timestamp("last_active_at", { withTimezone: true }).defaultNow(),
+  timezoneOffset: integer("timezone_offset").default(0),
+  ratingPrompted: boolean("rating_prompted").default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
 
@@ -42,6 +46,7 @@ export const questions = pgTable(
     status: questionStatusEnum("status").default("active").notNull(),
     yesCount: integer("yes_count").default(0).notNull(),
     noCount: integer("no_count").default(0).notNull(),
+    shareCount: integer("share_count").default(0).notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
@@ -105,7 +110,6 @@ export const notificationLog = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     questionId: uuid("question_id")
-      .notNull()
       .references(() => questions.id, { onDelete: "cascade" }),
     type: text("type").notNull(),
     sentAt: timestamp("sent_at", { withTimezone: true }).defaultNow().notNull(),
@@ -116,6 +120,55 @@ export const notificationLog = pgTable(
       table.questionId,
       table.type,
     ),
+  }),
+);
+
+export const shares = pgTable(
+  "shares",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    questionId: uuid("question_id")
+      .references(() => questions.id, { onDelete: "cascade" }),
+    userId: uuid("user_id")
+      .references(() => users.id, { onDelete: "cascade" }),
+    shareType: text("share_type").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    questionIdIdx: index("shares_question_id_idx").on(table.questionId),
+    userIdIdx: index("shares_user_id_idx").on(table.userId),
+  }),
+);
+
+export const qotd = pgTable(
+  "qotd",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    questionId: uuid("question_id")
+      .references(() => questions.id, { onDelete: "cascade" }),
+    date: date("date").notNull().unique(),
+    isManual: boolean("is_manual").default(false),
+  },
+  (table) => ({
+    dateIdx: index("qotd_date_idx").on(table.date),
+  }),
+);
+
+export const scheduledNotifications = pgTable(
+  "scheduled_notifications",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    userId: uuid("user_id")
+      .references(() => users.id, { onDelete: "cascade" }),
+    questionId: uuid("question_id")
+      .references(() => questions.id, { onDelete: "cascade" }),
+    type: text("type").notNull(),
+    sendAt: timestamp("send_at", { withTimezone: true }).notNull(),
+    sent: boolean("sent").default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    sendAtIdx: index("scheduled_notif_send_at_idx").on(table.sendAt),
   }),
 );
 

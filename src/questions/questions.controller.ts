@@ -13,6 +13,7 @@ import {
 import { RequestWithDevice } from "../common/types/request-with-device.interface";
 import { CreateQuestionDto } from "./dto/create-question.dto";
 import { ReportDto } from "./dto/report.dto";
+import { ShareDto } from "./dto/share.dto";
 import { VoteDto } from "./dto/vote.dto";
 import { QuestionRateLimitGuard } from "./question-rate-limit.guard";
 import { QuestionsService } from "./questions.service";
@@ -47,6 +48,11 @@ export class QuestionsController {
   @Post(":id/vote")
   async vote(@Param("id") id: string, @Body() voteDto: VoteDto, @Req() req: RequestWithDevice) {
     return this.questionsService.vote(id, voteDto, req);
+  }
+
+  @Post(":id/share")
+  async logShare(@Param("id") id: string, @Body() shareDto: ShareDto, @Req() req: RequestWithDevice) {
+    return this.questionsService.logShare(id, shareDto, req);
   }
 
   @Post(":id/report")
