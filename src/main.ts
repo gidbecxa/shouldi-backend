@@ -23,8 +23,8 @@ async function bootstrap() {
     }),
   );
 
-  await app.listen(port);
-  console.log(`Should I API (NestJS) listening on ${port}`);
+  await app.listen(port, "0.0.0.0");
+  console.log(`Should I API (NestJS) listening on 0.0.0.0:${port}`);
 }
 
 void bootstrap();
