@@ -29,7 +29,7 @@ COPY --from=builder /app/package.json ./package.json
 
 ENV NODE_ENV=production
 
-# Railway injects PORT automatically; default kept for local docker run.
-EXPOSE 5000
+# Fly.io (and Docker) will honour the PORT env var set in fly.toml (8080)
+EXPOSE 8080
 
 CMD ["node", "dist/main.js"]
