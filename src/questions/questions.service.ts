@@ -76,8 +76,12 @@ export class QuestionsService {
           const scored = (arr: (typeof questions.$inferSelect)[]) =>
             arr.map((row) => {
               const totalVotes = row.yesCount + row.noCount;
-              const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 1);
-              return { row, score: totalVotes / Math.pow(ageHours, 1.5) };
+              const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 0.1);
+              const baseScore = totalVotes / Math.pow(ageHours, 1.5);
+              // Freshness boost: linearly decays from 3x at 0 min to 1x at 90 min
+              const freshMinutes = ageHours * 60;
+              const freshnessMultiplier = freshMinutes < 90 ? 3 - (2 * freshMinutes / 90) : 1;
+              return { row, score: baseScore * freshnessMultiplier };
             }).sort((a, b) => b.score - a.score);
           const topLang = scored(langRows).slice(0, 15).map((e) => e.row);
           const topOther = scored(otherRows).slice(0, 5).map((e) => e.row);
@@ -88,8 +92,11 @@ export class QuestionsService {
           rows = rows
             .map((row) => {
               const totalVotes = row.yesCount + row.noCount;
-              const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 1);
-              return { row, score: totalVotes / Math.pow(ageHours, 1.5) };
+              const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 0.1);
+              const baseScore = totalVotes / Math.pow(ageHours, 1.5);
+              const freshMinutes = ageHours * 60;
+              const freshnessMultiplier = freshMinutes < 90 ? 3 - (2 * freshMinutes / 90) : 1;
+              return { row, score: baseScore * freshnessMultiplier };
             })
             .sort((a, b) => b.score - a.score)
             .slice(0, safeLimit)
@@ -235,6 +242,8 @@ export class QuestionsService {
 
   async vote(questionId: string, voteDto: VoteDto, request: RequestWithDevice) {
     const currentUser = await this.currentUserService.getById(request.userId);
+    const hardwareDeviceId = (request.headers["x-hardware-id"] as string | undefined) ?? null;
+    const browserId = (request.headers["x-browser-id"] as string | undefined) ?? null;
 
     const questionRows = await this.db
       .select({ id: questions.id, status: questions.status })
@@ -260,11 +269,37 @@ export class QuestionsService {
       throw new ConflictException({ error: "already_voted" });
     }
 
+    // Hardware device dedup — prevents voting from a different account on the same device
+    if (hardwareDeviceId) {
+      const existingHardwareVote = await this.db
+        .select({ id: votes.id })
+        .from(votes)
+        .where(and(eq(votes.questionId, questionId), eq(votes.hardwareDeviceId, hardwareDeviceId)))
+        .limit(1);
+      if (existingHardwareVote.length > 0) {
+        throw new ConflictException({ error: "already_voted" });
+      }
+    }
+
+    // Browser fingerprint dedup — web clients
+    if (browserId) {
+      const existingBrowserVote = await this.db
+        .select({ id: votes.id })
+        .from(votes)
+        .where(and(eq(votes.questionId, questionId), eq(votes.browserId, browserId)))
+        .limit(1);
+      if (existingBrowserVote.length > 0) {
+        throw new ConflictException({ error: "already_voted" });
+      }
+    }
+
     const updated = await this.db.transaction(async (tx) => {
       await tx.insert(votes).values({
         questionId,
         userId: currentUser.id,
         vote: voteDto.vote,
+        hardwareDeviceId,
+        browserId,
       });
 
       const increment =

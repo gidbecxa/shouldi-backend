@@ -70,6 +70,8 @@ export const votes = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     vote: voteChoiceEnum("vote").notNull(),
+    hardwareDeviceId: text("hardware_device_id"),
+    browserId: text("browser_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
