@@ -8,3 +8,5 @@ dist
 *.md
 scripts
 drizzle.config.ts
+supabase/
+src/db/migrations/
