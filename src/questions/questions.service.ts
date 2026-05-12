@@ -7,7 +7,7 @@
   InternalServerErrorException,
   NotFoundException,
 } from "@nestjs/common";
-import { and, count, desc, eq, gt, inArray, lt, ne, sql } from "drizzle-orm";
+import { and, count, desc, eq, gt, inArray, lt, ne, or, sql } from "drizzle-orm";
 import { randomUUID } from "crypto";
 import { createCanvas } from "@napi-rs/canvas";
 
@@ -46,6 +46,7 @@ export class QuestionsService {
     sort: "recent" | "hot" = "recent",
     cursor?: string,
     limit = 20,
+    language?: string,
   ) {
     return withTransientDatabaseRetry(async () => {
       const currentUser = await this.currentUserService.getById(request.userId);
@@ -61,23 +62,40 @@ export class QuestionsService {
 
       if (sort === "hot") {
         const since = new Date(Date.now() - 48 * 60 * 60 * 1000);
-        const rows = await this.db
-          .select()
-          .from(questions)
-          .where(and(...baseWhere, gt(questions.createdAt, since)))
-          .orderBy(desc(questions.createdAt))
-          .limit(100);
+        const hotWhere = [...baseWhere, gt(questions.createdAt, since)];
 
-        const now = Date.now();
-        questionRows = rows
-          .map((row) => {
-            const totalVotes = row.yesCount + row.noCount;
-            const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 1);
-            return { row, score: totalVotes / Math.pow(ageHours, 1.5) };
-          })
-          .sort((a, b) => b.score - a.score)
-          .slice(0, safeLimit)
-          .map((entry) => entry.row);
+        // Two-pass language priority: 15 in user's language + 5 in other language
+        let rows: (typeof questions.$inferSelect)[];
+        if (language) {
+          const otherLang = language === "fr" ? "en" : "fr";
+          const [langRows, otherRows] = await Promise.all([
+            this.db.select().from(questions).where(and(...hotWhere, eq(questions.language, language))).orderBy(desc(questions.createdAt)).limit(100),
+            this.db.select().from(questions).where(and(...hotWhere, eq(questions.language, otherLang))).orderBy(desc(questions.createdAt)).limit(50),
+          ]);
+          const now = Date.now();
+          const scored = (arr: (typeof questions.$inferSelect)[]) =>
+            arr.map((row) => {
+              const totalVotes = row.yesCount + row.noCount;
+              const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 1);
+              return { row, score: totalVotes / Math.pow(ageHours, 1.5) };
+            }).sort((a, b) => b.score - a.score);
+          const topLang = scored(langRows).slice(0, 15).map((e) => e.row);
+          const topOther = scored(otherRows).slice(0, 5).map((e) => e.row);
+          rows = [...topLang, ...topOther];
+        } else {
+          rows = await this.db.select().from(questions).where(and(...hotWhere)).orderBy(desc(questions.createdAt)).limit(100);
+          const now = Date.now();
+          rows = rows
+            .map((row) => {
+              const totalVotes = row.yesCount + row.noCount;
+              const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 1);
+              return { row, score: totalVotes / Math.pow(ageHours, 1.5) };
+            })
+            .sort((a, b) => b.score - a.score)
+            .slice(0, safeLimit)
+            .map((entry) => entry.row);
+        }
+        questionRows = rows;
       } else {
         const whereClause = cursor
           ? and(...baseWhere, lt(questions.createdAt, new Date(cursor)))
@@ -190,6 +208,7 @@ export class QuestionsService {
         userId: currentUser.id,
         text: createQuestionDto.text,
         category: createQuestionDto.category,
+        language: createQuestionDto.language ?? "en",
         expiresAt,
       })
       .returning();
@@ -506,6 +525,7 @@ export class QuestionsService {
       user_voted: userVote,
       is_own: question.userId === currentUserId,
       is_trending: isTrending,
+      language: question.language,
     };
   }
 }

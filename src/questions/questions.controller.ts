@@ -29,9 +29,10 @@ export class QuestionsController {
     @Query("category") category?: string,
     @Query("sort") sort: "recent" | "hot" = "recent",
     @Query("limit") limit?: string,
+    @Query("language") language?: string,
   ) {
     const parsedLimit = Number.parseInt(limit ?? "20", 10);
-    return this.questionsService.getFeed(req, category, sort, cursor, parsedLimit);
+    return this.questionsService.getFeed(req, category, sort, cursor, parsedLimit, language);
   }
 
   @Get(":id")

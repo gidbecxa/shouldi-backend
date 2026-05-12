@@ -1,4 +1,4 @@
-import { IsIn, IsInt, IsString, MaxLength, Min, MinLength } from "class-validator";
+import { IsIn, IsInt, IsOptional, IsString, MaxLength, Min, MinLength } from "class-validator";
 
 const categories = ["Life", "Love", "Career", "Money", "Health", "Fun", "Other"] as const;
 
@@ -17,4 +17,8 @@ export class CreateQuestionDto {
   @IsIn([1, 6, 24, 72])
   @Min(1)
   duration_hours!: 1 | 6 | 24 | 72;
+
+  @IsOptional()
+  @IsIn(["en", "fr"])
+  language?: "en" | "fr";
 }

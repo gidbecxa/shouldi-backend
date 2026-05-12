@@ -47,6 +47,7 @@ export const questions = pgTable(
     yesCount: integer("yes_count").default(0).notNull(),
     noCount: integer("no_count").default(0).notNull(),
     shareCount: integer("share_count").default(0).notNull(),
+    language: text("language").notNull().default("en"),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
@@ -54,6 +55,7 @@ export const questions = pgTable(
     userIdIdx: index("questions_user_id_idx").on(table.userId),
     statusCreatedIdx: index("questions_status_created_idx").on(table.status, table.createdAt),
     expiresAtIdx: index("questions_expires_at_idx").on(table.expiresAt),
+    languageIdx: index("idx_questions_language").on(table.language, table.status, table.createdAt),
   }),
 );
 
