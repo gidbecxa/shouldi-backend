@@ -42,11 +42,13 @@ export const questions = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
     text: text("text").notNull(),
+    context: text("context"),
     category: text("category").notNull().default("general"),
     status: questionStatusEnum("status").default("active").notNull(),
     yesCount: integer("yes_count").default(0).notNull(),
     noCount: integer("no_count").default(0).notNull(),
     shareCount: integer("share_count").default(0).notNull(),
+    takesCount: integer("takes_count").default(0).notNull(),
     language: text("language").notNull().default("en"),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
@@ -182,3 +184,27 @@ export const waitlist = pgTable("waitlist", {
   source: text("source").default("website").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+export const takeStatusEnum = pgEnum("take_status", ["active", "flagged", "deleted"]);
+
+export const takes = pgTable(
+  "takes",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    questionId: uuid("question_id")
+      .notNull()
+      .references(() => questions.id, { onDelete: "cascade" }),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    vote: voteChoiceEnum("vote").notNull(),
+    content: text("content").notNull(),
+    status: takeStatusEnum("status").default("active").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    questionUserUniq: unique("takes_question_user_uniq").on(table.questionId, table.userId),
+    questionIdIdx: index("idx_takes_question").on(table.questionId, table.status, table.createdAt),
+    userIdIdx: index("idx_takes_user").on(table.userId),
+  }),
+);

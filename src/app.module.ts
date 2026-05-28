@@ -58,6 +58,8 @@ export class AppModule implements NestModule {
       { path: "questions/:id/vote", method: RequestMethod.POST },
       { path: "questions/:id/share", method: RequestMethod.POST },
       { path: "questions/:id/report", method: RequestMethod.POST },
+      { path: "questions/:questionId/takes", method: RequestMethod.POST },
+      { path: "questions/:questionId/takes/:takeId", method: RequestMethod.DELETE },
       { path: "auth/me", method: RequestMethod.GET },
       { path: "users/me/questions", method: RequestMethod.GET },
       { path: "users/me/push-token", method: RequestMethod.PATCH },

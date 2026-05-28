@@ -12,6 +12,7 @@ import { CurrentUserService } from "../common/current-user.service";
 import { DatabaseService } from "../common/database/database.service";
 import { withTransientDatabaseRetry } from "../common/database/transient-database.util";
 import { users } from "../db/schema";
+import { EmailService } from "../lib/email.service";
 
 const userSessionProjection = {
   id: users.id,
@@ -49,6 +50,7 @@ export class AuthService {
     private readonly authTokenService: AuthTokenService,
     private readonly databaseService: DatabaseService,
     private readonly configService: ConfigService,
+    private readonly emailService: EmailService,
   ) {}
 
   private get db() {
@@ -110,7 +112,16 @@ export class AuthService {
       .returning(userSessionProjection);
 
     if (inserted.length > 0) {
-      return this.toSessionResponse(inserted[0] as UserSessionRow);
+      const newUser = inserted[0] as UserSessionRow;
+      // Send welcome email non-blocking — must never throw or delay response
+      if (newUser.email) {
+        setImmediate(() => {
+          this.emailService.sendWelcomeEmail(newUser.email!, newUser.displayName).catch(
+            (err: unknown) => console.error("[auth] welcome email failed", err instanceof Error ? err.message : err),
+          );
+        });
+      }
+      return this.toSessionResponse(newUser);
     }
 
     const recovered = await this.findSessionRowByGoogleIdentity(

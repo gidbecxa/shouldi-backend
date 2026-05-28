@@ -214,6 +214,7 @@ export class QuestionsService {
       .values({
         userId: currentUser.id,
         text: createQuestionDto.text,
+        context: createQuestionDto.context?.trim() ?? null,
         category: createQuestionDto.category,
         language: createQuestionDto.language ?? "en",
         expiresAt,
@@ -550,6 +551,7 @@ export class QuestionsService {
     return {
       id: question.id,
       text: question.text,
+      context: question.context ?? null,
       category: question.category,
       yes_count: question.yesCount,
       no_count: question.noCount,
@@ -561,6 +563,7 @@ export class QuestionsService {
       is_own: question.userId === currentUserId,
       is_trending: isTrending,
       language: question.language,
+      takes_count: question.takesCount,
     };
   }
 }

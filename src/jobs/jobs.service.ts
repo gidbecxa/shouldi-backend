@@ -4,6 +4,7 @@ import { and, eq, gte, inArray, isNotNull, lte, ne, sql } from "drizzle-orm";
 
 import { DatabaseService } from "../common/database/database.service";
 import { RedisService } from "../lib/redis.service";
+import { EmailService } from "../lib/email.service";
 import { notificationLog, qotd, questions, scheduledNotifications, users, votes as votesTable } from "../db/schema";
 import { PushService } from "./push.service";
 
@@ -23,6 +24,7 @@ export class JobsService {
     private readonly databaseService: DatabaseService,
     private readonly redisService: RedisService,
     private readonly pushService: PushService,
+    private readonly emailService: EmailService,
   ) {}
 
   private get db() {
@@ -88,6 +90,28 @@ export class JobsService {
         closedQ.id,
         { exempt: true },
       );
+
+      // Send result email to poster if they have an email address
+      const posterRows = await this.db
+        .select({ email: users.email })
+        .from(users)
+        .where(eq(users.id, closedQ.userId))
+        .limit(1);
+
+      const poster = posterRows[0];
+      if (poster?.email) {
+        setImmediate(() => {
+          this.emailService.sendResultEmail({
+            to: poster.email!,
+            questionText: closedQ.text,
+            questionId: closedQ.id,
+            yesPercent,
+            totalVotes,
+          }).catch((err: unknown) => {
+            console.error("[jobs] result email failed", err instanceof Error ? err.message : err);
+          });
+        });
+      }
     } catch (err: unknown) {
       console.error("[jobs] sendResultNotification failed", err instanceof Error ? err.message : err);
     }
@@ -241,6 +265,64 @@ export class JobsService {
 
         // Small delay to avoid batching too fast against Expo push service
         await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+
+      // Re-engagement emails for web-only signed-in users (have email, no push token)
+      // 7-day inactivity window (longer than the 48h push window)
+      const cutoff7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+      const webOnlyUsers = await this.db
+        .select({ id: users.id, email: users.email })
+        .from(users)
+        .where(
+          and(
+            isNotNull(users.email),
+            sql`${users.pushToken} IS NULL`,
+            eq(users.isBanned, false),
+            lte(users.lastActiveAt, cutoff7d),
+            gte(users.lastActiveAt, cutoff30d),
+          ),
+        )
+        .limit(200);
+
+      if (webOnlyUsers.length > 0) {
+        const webUserIds = webOnlyUsers.map((u) => u.id);
+
+        const recentEmailNotifs = await this.db
+          .select({ userId: notificationLog.userId })
+          .from(notificationLog)
+          .where(
+            and(
+              inArray(notificationLog.userId, webUserIds),
+              eq(notificationLog.type, "re_engage_email"),
+              gte(notificationLog.sentAt, cutoff7d),
+            ),
+          );
+
+        const alreadyEmailSent = new Set(recentEmailNotifs.map((n) => n.userId));
+
+        for (const user of webOnlyUsers) {
+          if (alreadyEmailSent.has(user.id) || !user.email) continue;
+
+          await this.emailService.sendReEngagementEmail({
+            to: user.email,
+            trendingQuestion: {
+              text: trendingQuestion.text,
+              id: trendingQuestion.id,
+              yesPercent,
+              totalVotes,
+            },
+          });
+
+          // Log the email notification to prevent duplicates
+          await this.db.insert(notificationLog).values({
+            userId: user.id,
+            type: "re_engage_email",
+            sentAt: new Date(),
+          }).onConflictDoNothing();
+
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
       }
     } catch (err: unknown) {
       console.error("[jobs] sendReEngagement failed", err instanceof Error ? err.message : err);

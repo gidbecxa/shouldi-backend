@@ -7,7 +7,7 @@ export type Category = (typeof categories)[number];
 export class CreateQuestionDto {
   @IsString()
   @MinLength(1)
-  @MaxLength(120)
+  @MaxLength(200)
   text!: string;
 
   @IsIn(categories)
@@ -21,4 +21,9 @@ export class CreateQuestionDto {
   @IsOptional()
   @IsIn(["en", "fr"])
   language?: "en" | "fr";
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(280)
+  context?: string;
 }
