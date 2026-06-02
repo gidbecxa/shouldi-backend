@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import WebSocket from "ws";
 
 @Injectable()
 export class SupabaseService {
@@ -22,6 +23,10 @@ export class SupabaseService {
         autoRefreshToken: false,
         persistSession: false,
       },
+      // Node.js < 22 has no native WebSocket; provide the 'ws' implementation
+      // so the RealtimeClient (created internally by createClient) can start.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      realtime: { transport: WebSocket as any },
     });
 
     return this.client;

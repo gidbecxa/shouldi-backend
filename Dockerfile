@@ -1,5 +1,5 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM node:20-slim AS builder
+FROM node:22-slim AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 # ── Stage 2: production image ──────────────────────────────────────────────────
-FROM node:20-slim AS runner
+FROM node:22-slim AS runner
 
 # @napi-rs/canvas pre-built binary needs libfontconfig at runtime for
 # font resolution when drawing the share-card PNG.
