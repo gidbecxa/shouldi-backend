@@ -16,9 +16,34 @@ import { withTransientDatabaseRetry } from "../common/database/transient-databas
 import { CurrentUserService } from "../common/current-user.service";
 import { RequestWithDevice } from "../common/types/request-with-device.interface";
 import { questions, reports, scheduledNotifications, shares, votes } from "../db/schema";
+import { encodeCursor, decodeCursor, buildCursorFromItem } from "../lib/feedCursor";
 import { RedisService } from "../lib/redis.service";
+import { SupabaseService } from "../lib/supabase.service";
 import { NotificationTriggersService } from "../jobs/notification-triggers.service";
 import { ContentFilterService } from "./content-filter.service";
+
+/** Shape returned by the get_personalized_feed PostgreSQL function */
+interface FeedRow {
+  id: string;
+  text: string;
+  context: string | null;
+  category: string;
+  language: string;
+  status: string;
+  yes_count: number;
+  no_count: number;
+  total_votes: number;
+  yes_percent: number;
+  takes_count: number;
+  expires_at: string;
+  created_at: string;
+  user_voted: "yes" | "no" | null;
+  user_has_engaged: boolean;
+  is_own: boolean;
+  priority_tier: number;
+  trending_score: number;
+  is_trending: boolean;
+}
 import { CreateQuestionDto } from "./dto/create-question.dto";
 import { ReportDto } from "./dto/report.dto";
 import { ShareDto } from "./dto/share.dto";
@@ -33,6 +58,7 @@ export class QuestionsService {
     private readonly currentUserService: CurrentUserService,
     private readonly databaseService: DatabaseService,
     private readonly redisService: RedisService,
+    private readonly supabaseService: SupabaseService,
     private readonly notificationTriggersService: NotificationTriggersService,
   ) {}
 
@@ -44,108 +70,94 @@ export class QuestionsService {
     request: RequestWithDevice,
     category?: string,
     sort: "recent" | "hot" = "recent",
-    cursor?: string,
+    cursorEncoded?: string,
     limit = 20,
     language?: string,
+    fetchedAtParam?: string,
   ) {
     return withTransientDatabaseRetry(async () => {
       const currentUser = await this.currentUserService.getById(request.userId);
       const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(limit, 50)) : 20;
+      const userLanguage = language ?? "en";
 
-      const baseWhere = [eq(questions.status, "active")];
-      if (category) {
-        baseWhere.push(eq(questions.category, category));
+      // Decode compound cursor (null = first page)
+      const cursor = cursorEncoded ? decodeCursor(cursorEncoded) : null;
+
+      // Feed session anchor: prevents page-shift when new questions arrive during browsing.
+      // First page sets this; all subsequent pages send it back.
+      const fetchedAt: string = cursor?.fetchedAt ?? fetchedAtParam ?? new Date().toISOString();
+
+      // ── Call the personalized feed PostgreSQL function ─────────────────
+      const supabase = this.supabaseService.getAdminClient();
+      const { data, error } = await supabase.rpc("get_personalized_feed", {
+        p_user_id:       currentUser.id,
+        p_user_language: userLanguage,
+        p_sort:          sort,
+        p_limit:         safeLimit,
+        p_cursor_tier:   cursor?.tier      ?? null,
+        p_cursor_sort:   cursor?.sortValue ?? null,
+        p_cursor_id:     cursor?.id        ?? null,
+        p_fetched_at:    fetchedAt,
+      });
+
+      if (error) {
+        console.error("[feed] get_personalized_feed error:", error);
+        throw new InternalServerErrorException("feed_query_failed");
       }
 
-      let questionRows: (typeof questions.$inferSelect)[];
+      const rows = (data ?? []) as FeedRow[];
+
+      // The SQL function returns limit+1 rows so we can detect hasMore cheaply.
+      const hasMore = rows.length > safeLimit;
+      const pageRows = hasMore ? rows.slice(0, safeLimit) : rows;
+
+      // ── Build compound cursor from the last returned item ──────────────
       let nextCursor: string | null = null;
-
-      if (sort === "hot") {
-        const since = new Date(Date.now() - 48 * 60 * 60 * 1000);
-        const hotWhere = [...baseWhere, gt(questions.createdAt, since)];
-
-        // Two-pass language priority: 15 in user's language + 5 in other language
-        let rows: (typeof questions.$inferSelect)[];
-        if (language) {
-          const otherLang = language === "fr" ? "en" : "fr";
-          const [langRows, otherRows] = await Promise.all([
-            this.db.select().from(questions).where(and(...hotWhere, eq(questions.language, language))).orderBy(desc(questions.createdAt)).limit(100),
-            this.db.select().from(questions).where(and(...hotWhere, eq(questions.language, otherLang))).orderBy(desc(questions.createdAt)).limit(50),
-          ]);
-          const now = Date.now();
-          const scored = (arr: (typeof questions.$inferSelect)[]) =>
-            arr.map((row) => {
-              const totalVotes = row.yesCount + row.noCount;
-              const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 0.1);
-              const baseScore = totalVotes / Math.pow(ageHours, 1.5);
-              // Freshness boost: linearly decays from 3x at 0 min to 1x at 90 min
-              const freshMinutes = ageHours * 60;
-              const freshnessMultiplier = freshMinutes < 90 ? 3 - (2 * freshMinutes / 90) : 1;
-              return { row, score: baseScore * freshnessMultiplier };
-            }).sort((a, b) => b.score - a.score);
-          const topLang = scored(langRows).slice(0, 15).map((e) => e.row);
-          const topOther = scored(otherRows).slice(0, 5).map((e) => e.row);
-          rows = [...topLang, ...topOther];
-        } else {
-          rows = await this.db.select().from(questions).where(and(...hotWhere)).orderBy(desc(questions.createdAt)).limit(100);
-          const now = Date.now();
-          rows = rows
-            .map((row) => {
-              const totalVotes = row.yesCount + row.noCount;
-              const ageHours = Math.max((now - row.createdAt.getTime()) / (1000 * 60 * 60), 0.1);
-              const baseScore = totalVotes / Math.pow(ageHours, 1.5);
-              const freshMinutes = ageHours * 60;
-              const freshnessMultiplier = freshMinutes < 90 ? 3 - (2 * freshMinutes / 90) : 1;
-              return { row, score: baseScore * freshnessMultiplier };
-            })
-            .sort((a, b) => b.score - a.score)
-            .slice(0, safeLimit)
-            .map((entry) => entry.row);
-        }
-        questionRows = rows;
-      } else {
-        const whereClause = cursor
-          ? and(...baseWhere, lt(questions.createdAt, new Date(cursor)))
-          : and(...baseWhere);
-
-        const rows = await this.db
-          .select()
-          .from(questions)
-          .where(whereClause)
-          .orderBy(desc(questions.createdAt))
-          .limit(safeLimit + 1);
-
-        const hasMore = rows.length > safeLimit;
-        questionRows = hasMore ? rows.slice(0, safeLimit) : rows;
-        nextCursor = hasMore
-          ? (questionRows[questionRows.length - 1]?.createdAt?.toISOString() ?? null)
-          : null;
+      if (hasMore && pageRows.length > 0) {
+        const lastItem = pageRows[pageRows.length - 1];
+        nextCursor = encodeCursor(buildCursorFromItem(lastItem, sort, fetchedAt));
       }
 
-      const userVoteMap = await this.loadUserVotes(
-        currentUser.id,
-        questionRows.map((r) => r.id),
-      );
-
-      // Fetch trending IDs from Redis (top 5)
-      let trendingIds: Set<string> = new Set();
+      // ── Merge Redis trending set (cosmetic badge override) ─────────────
+      let redisTrendingIds: Set<string> = new Set();
       try {
         const redis = this.redisService.getClient();
         const ids = await redis.zrange("trending:questions", 0, 4, { rev: true });
-        trendingIds = new Set(ids.filter((id): id is string => typeof id === "string"));
+        redisTrendingIds = new Set(ids.filter((id): id is string => typeof id === "string"));
       } catch {
         // Non-fatal — trending badge is cosmetic
       }
 
       return {
-        questions: questionRows.map((row) =>
-          this.toQuestionResponse(row, currentUser.id, userVoteMap.get(row.id) ?? null, trendingIds.has(row.id)),
-        ),
+        questions: pageRows.map((row) => this.toFeedResponse(row, redisTrendingIds)),
         next_cursor: nextCursor,
+        fetched_at: fetchedAt,
       };
     }, {
       label: "QuestionsService.getFeed",
     });
+  }
+
+  private toFeedResponse(row: FeedRow, redisTrendingIds: Set<string>) {
+    return {
+      id:               row.id,
+      text:             row.text,
+      context:          row.context ?? null,
+      category:         row.category,
+      language:         row.language,
+      status:           row.status,
+      yes_count:        row.yes_count,
+      no_count:         row.no_count,
+      yes_percent:      row.yes_percent,
+      total_votes:      row.total_votes,
+      takes_count:      row.takes_count,
+      expires_at:       row.expires_at,
+      created_at:       row.created_at,
+      user_voted:       row.user_voted,
+      user_has_engaged: row.user_has_engaged,
+      is_own:           row.is_own,
+      is_trending:      row.is_trending || redisTrendingIds.has(row.id),
+    };
   }
 
   async getQuestionById(questionId: string, request: RequestWithDevice) {
